@@ -1,0 +1,24 @@
+name: bridge-bot
+
+services:
+  - name: telegram-bot
+    type: web
+    instance_type: nano
+    regions:
+      - was
+    git:
+      branch: main
+      build_command: pip install -r requirements.txt
+      run_command: python main.py
+    ports:
+      - port: 8000
+        protocol: http
+    health_checks:
+      - path: /
+        port: 8000
+        protocol: http
+    env:
+      - name: BOT_TOKEN
+        secret: BOT_TOKEN
+      - name: PORT
+        value: "8000"
