@@ -124,11 +124,35 @@ def get_headers(user_id: int) -> dict:
     return headers
 
 
+def _safe_json(resp) -> dict:
+    """Safely parse JSON from a response; return error dict if empty or invalid."""
+    try:
+        text = resp.text.strip()
+        if not text:
+            logger.warning(f"Empty response body (HTTP {resp.status_code})")
+            return {"status": 0, "message": f"Empty response from server (HTTP {resp.status_code})"}
+        return resp.json()
+    except Exception as e:
+        logger.warning(f"JSON parse error: {e} | body: {resp.text[:200]}")
+        return {"status": 0, "message": f"Invalid JSON from server: {resp.text[:100]}"}
+
+
 def api_post(endpoint_key: str, data: dict, user_id: int = 0) -> dict:
     url = API_BASE + ENDPOINTS.get(endpoint_key, endpoint_key)
+    headers = get_headers(user_id)
+    logger.info(f"POST {url} | data={data}")
     try:
-        resp = requests.post(url, json=data, headers=get_headers(user_id), timeout=20, verify=True)
-        return resp.json()
+        # Try JSON body first (as the app does)
+        resp = requests.post(url, json=data, headers=headers, timeout=20, verify=True)
+        result = _safe_json(resp)
+        # If server returned empty/error, retry with form-encoded (some LCT endpoints require it)
+        if result.get("status") == 0 and not resp.text.strip():
+            form_headers = {k: v for k, v in headers.items() if k != "Content-Type"}
+            resp2 = requests.post(url, data=data, headers=form_headers, timeout=20, verify=True)
+            result2 = _safe_json(resp2)
+            if result2.get("status") != 0:
+                return result2
+        return result
     except Exception as e:
         logger.error(f"API POST error [{endpoint_key}]: {e}")
         return {"status": 0, "message": str(e)}
@@ -136,9 +160,10 @@ def api_post(endpoint_key: str, data: dict, user_id: int = 0) -> dict:
 
 def api_get(endpoint_key: str, params: dict = None, user_id: int = 0) -> dict:
     url = API_BASE + ENDPOINTS.get(endpoint_key, endpoint_key)
+    logger.info(f"GET {url} | params={params}")
     try:
         resp = requests.get(url, params=params, headers=get_headers(user_id), timeout=20, verify=True)
-        return resp.json()
+        return _safe_json(resp)
     except Exception as e:
         logger.error(f"API GET error [{endpoint_key}]: {e}")
         return {"status": 0, "message": str(e)}
@@ -428,23 +453,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mobile"]     = text
         context.user_data["login_step"] = "awaiting_otp"
 
-        resp = api_post("send_otp", {"mobile": text, "type": "login"})
-        if resp.get("status") == 1:
+        # Try 3 variants: type=login, type=register, no type
+        sent = False
+        for payload in [
+            {"mobile": text, "type": "login"},
+            {"mobile": text, "type": "register"},
+            {"mobile": text},
+        ]:
+            r = api_post("send_otp", payload)
+            logger.info(f"send_otp payload={payload} response={r}")
+            if r.get("status") == 1:
+                sent = True
+                await update.message.reply_text(
+                    f"✅ OTP sent to {text}.\nNow enter the *OTP* you received:",
+                    parse_mode="Markdown"
+                )
+                break
+
+        if not sent:
+            # Server may send OTP silently (status!=1 but OTP still arrives)
             await update.message.reply_text(
-                f"✅ OTP sent to {text}.\nNow enter the *OTP* you received:",
+                f"⚠️ Server did not confirm OTP dispatch for {text}.\n"
+                f"If you received an OTP on your phone, enter it now.\n"
+                f"Otherwise this number may not be registered in the app.",
                 parse_mode="Markdown"
             )
-        else:
-            await update.message.reply_text(
-                f"⚠️ Could not send OTP: {resp.get('message','Unknown error')}\n"
-                "Trying register endpoint..."
-            )
-            resp2 = api_post("send_otp", {"mobile": text, "type": "register"})
-            if resp2.get("status") == 1:
-                await update.message.reply_text("✅ OTP sent! Enter it below:")
-            else:
-                await update.message.reply_text(f"❌ Failed: {resp2.get('message','Error')}")
-                context.user_data["login_step"] = ""
+            # Keep login_step = awaiting_otp so user can still try
 
     elif step == "awaiting_otp":
         mobile = context.user_data.get("mobile", "")
