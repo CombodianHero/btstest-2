@@ -1,787 +1,529 @@
 """
-Bridge to Success — Telegram Bot Extractor
-Deployment: Koyeb (Web Service with health-check server)
+Bridge to Success — No-Login Batch Extractor
+==============================================
+Extracts all available course/batch info WITHOUT any login.
+
+How this works (confirmed from APK reverse engineering):
+  - Every request adds two headers from AppManager.getT():
+      ktx  = "com.lct.bmightc"   (app package name)
+      ktxx = "12.0"               (app version key)
+  - AppManager.getUserId() returns "" (empty string) when not logged in
+  - allCourses / topCourses / getCategory all accept userId=""
+  - The server trusts the ktx/ktxx headers to identify the app
+
+API Base: https://bridgetosuccess.learncentre.tech/public/study_api_sprint13_security_promo/
+Package : com.lct.bmightc
+
+What this script extracts (no login needed):
+  - All available courses/batches (name, ID, price, image, category)
+  - Top/featured courses
+  - Subject/category list inside each course
+  - Free videos & PDFs (publicly listed)
+  - Course info (description, faculty, duration)
+
+What requires login:
+  - Enrolled course videos (myCourseVideo)
+  - Enrolled course PDFs  (myCoursePdf)
+  - Live class links
+
+Usage:
+    pip install requests
+    python bridgetosuccess_nologin_extractor.py
 """
 
-import os
-import logging
-import asyncio
-import threading
+import sys, os, re, time, json
 import requests
-import json
-import time
-import sys
 
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters
-)
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION  — set BOT_TOKEN as environment variable on Koyeb dashboard
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── Constants ────────────────────────────────────────────────────────────────
+API_BASE    = "https://bridgetosuccess.learncentre.tech/public/study_api_sprint13_security_promo/"
+COURSE_HOST = "https://bridgetosuccess.learncentre.tech/public/storage/course/"
+VIDEO_HOST  = "https://bridgetosuccess.learncentre.tech/public/storage/video/"
+PDF_HOST    = "https://bridgetosuccess.learncentre.tech/public/storage/pdf/"
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-# ── API Constants ─────────────────────────────────────────────────────────────
-BASE_URL    = "https://bridgetosuccess.learncentre.tech"
-API_BASE    = f"{BASE_URL}/public/study_api_sprint13_security_promo/"
-STORAGE_PDF = f"{BASE_URL}/public/storage/pdf/"
-STORAGE_VID = f"{BASE_URL}/public/storage/video/"
-STORAGE_IMG = f"{BASE_URL}/public/storage/course/"
-PLAYER_URL  = "https://lctplayer.learncentre.online/v/player.php?v="
-LIVE_URL    = "https://lctplayer.learncentre.online/live/live_player.php?v="
-
-# ── Discovered API Endpoints ──────────────────────────────────────────────────
-ENDPOINTS = {
-    # Auth
-    "send_otp"         : "send-otp",
-    "verify_otp"       : "verify-otp",
-    "register"         : "register",
-    "login"            : "login",
-    # Home / Dashboard
-    "home"             : "get-home-data",
-    "slider"           : "get-slider",
-    "notifications"    : "get-notifications",
-    "profile"          : "get-profile",
-    # Courses & Batches
-    "all_courses"      : "get-all-courses",
-    "my_courses"       : "get-my-courses",
-    "top_courses"      : "get-top-courses",
-    "course_detail"    : "get-course-detail",
-    "categories"       : "get-categories",
-    "category_courses" : "get-category-courses",
-    # Batch / Subject / Chapter
-    "batch_list"       : "get-batch-list",
-    "subject_list"     : "get-subject-list",
-    "chapter_list"     : "get-chapter-list",
-    "topic_list"       : "get-topic-list",
-    # Videos
-    "video_list"       : "get-video-list",
-    "video_detail"     : "get-video-detail",
-    "free_videos"      : "get-free-video",
-    # PDFs / Notes
-    "pdf_list"         : "get-pdf-list",
-    "pdf_detail"       : "get-pdf-detail",
-    "free_pdfs"        : "get-free-pdf",
-    # Live Classes
-    "live_classes"     : "get-live-class",
-    "live_stream"      : "get-live-stream",
-    # EBooks
-    "ebook_list"       : "get-ebook-list",
-    "ebook_series"     : "get-ebook-series",
-    # Tests
-    "test_series"      : "get-test-series",
-    "test_list"        : "get-test-list",
-    "test_detail"      : "get-test-detail",
-    # Doubts / Tickets
-    "doubt_courses"    : "get-doubt-courses",
-    "doubt_list"       : "get-doubt-list",
-    "ticket_list"      : "get-ticket-list",
-    # Mixed content
-    "mixed_content"    : "get-mixed-content",
-    # News / Board Results
-    "news"             : "get-news",
-    "board_result"     : "get-board-result",
-    # Events
-    "events"           : "get-events",
-    "event_video"      : "get-event-video",
-    # Downloads
-    "download_list"    : "get-download-list",
-    # Shop / Cart
-    "cart"             : "get-cart",
-    "purchase"         : "purchase-course",
-    "enroll_free"      : "enroll-free-course",
+# Injected on every request by AppManager.getT() — confirmed from smali
+APP_HEADERS = {
+    "ktx":  "com.lct.bmightc",   # package name
+    "ktxx": "12.0",               # version key
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGGER
-# ─────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+HEADERS = {
+    "User-Agent":   "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+    "Accept":       "application/json, text/plain, */*",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Referer":      "https://bridgetosuccess.learncentre.tech/",
+    "Origin":       "https://bridgetosuccess.learncentre.tech",
+    **APP_HEADERS,
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SESSION MANAGER
-# ─────────────────────────────────────────────────────────────────────────────
-user_sessions: dict = {}
+# ─── Colors ───────────────────────────────────────────────────────────────────
+class C:
+    HEADER = '\033[95m'
+    BLUE   = '\033[94m'
+    CYAN   = '\033[96m'
+    GREEN  = '\033[92m'
+    YELLOW = '\033[93m'
+    RED    = '\033[91m'
+    BOLD   = '\033[1m'
+    END    = '\033[0m'
 
-
-def get_headers(user_id: int) -> dict:
-    headers = {
-        "Content-Type" : "application/json",
-        "Accept"       : "application/json",
-        "User-Agent"   : "okhttp/4.9.3",
-        "Connection"   : "keep-alive",
-    }
-    if user_id in user_sessions and user_sessions[user_id].get("token"):
-        headers["Authorization"] = f"Bearer {user_sessions[user_id]['token']}"
-        headers["authtoken"]     = user_sessions[user_id]["token"]
-    return headers
-
-
-def _safe_json(resp) -> dict:
-    """Safely parse JSON from a response; return error dict if empty or invalid."""
+# ─── Core API Call ────────────────────────────────────────────────────────────
+def post(tag: str, extra: dict = {}) -> dict | None:
+    """POST to the API. userId="" works for all public endpoints."""
+    payload = {"tag": tag, "userId": "", **extra}
     try:
-        text = resp.text.strip()
-        if not text:
-            logger.warning(f"Empty response body (HTTP {resp.status_code})")
-            return {"status": 0, "message": f"Empty response from server (HTTP {resp.status_code})"}
-        return resp.json()
+        r = requests.post(API_BASE, data=payload, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.Timeout:
+        print(f"{C.RED}  [!] Timeout on tag={tag}{C.END}")
+    except requests.exceptions.HTTPError as e:
+        print(f"{C.RED}  [!] HTTP {e.response.status_code} on tag={tag}{C.END}")
     except Exception as e:
-        logger.warning(f"JSON parse error: {e} | body: {resp.text[:200]}")
-        return {"status": 0, "message": f"Invalid JSON from server: {resp.text[:100]}"}
+        print(f"{C.RED}  [!] Error on tag={tag}: {e}{C.END}")
+    return None
 
 
-def api_post(endpoint_key: str, data: dict, user_id: int = 0) -> dict:
-    url = API_BASE + ENDPOINTS.get(endpoint_key, endpoint_key)
-    headers = get_headers(user_id)
-    logger.info(f"POST {url} | data={data}")
-    try:
-        # Try JSON body first (as the app does)
-        resp = requests.post(url, json=data, headers=headers, timeout=20, verify=True)
-        result = _safe_json(resp)
-        # If server returned empty/error, retry with form-encoded (some LCT endpoints require it)
-        if result.get("status") == 0 and not resp.text.strip():
-            form_headers = {k: v for k, v in headers.items() if k != "Content-Type"}
-            resp2 = requests.post(url, data=data, headers=form_headers, timeout=20, verify=True)
-            result2 = _safe_json(resp2)
-            if result2.get("status") != 0:
-                return result2
-        return result
-    except Exception as e:
-        logger.error(f"API POST error [{endpoint_key}]: {e}")
-        return {"status": 0, "message": str(e)}
+def safe_list(data, *keys) -> list:
+    """Extract a list from nested dict keys, trying each key."""
+    if not data:
+        return []
+    for k in keys:
+        val = data.get(k)
+        if isinstance(val, list) and val:
+            return val
+    return []
 
 
-def api_get(endpoint_key: str, params: dict = None, user_id: int = 0) -> dict:
-    url = API_BASE + ENDPOINTS.get(endpoint_key, endpoint_key)
-    logger.info(f"GET {url} | params={params}")
-    try:
-        resp = requests.get(url, params=params, headers=get_headers(user_id), timeout=20, verify=True)
-        return _safe_json(resp)
-    except Exception as e:
-        logger.error(f"API GET error [{endpoint_key}]: {e}")
-        return {"status": 0, "message": str(e)}
+def sanitize(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    return re.sub(r'[\s_]+', '_', name).strip('_. ') or "Unknown"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LINK EXTRACTORS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_video_url(video_data: dict) -> str:
-    fields = [
-        "video_url", "videoUrl", "videoLink", "video_link",
-        "hls_url", "stream_url", "url", "file_url",
-        "dash_url", "mp4_url", "link"
-    ]
-    for f in fields:
-        val = video_data.get(f)
-        if val and isinstance(val, str) and len(val) > 5:
-            if val.startswith("storage/"):
-                return STORAGE_VID + val.replace("storage/video/", "")
-            if val.startswith("http"):
-                return val
-            if val.isdigit() or (len(val) < 30 and "/" not in val):
-                return PLAYER_URL + val
-    vid_id = video_data.get("video_id") or video_data.get("videoId") or video_data.get("id")
-    if vid_id:
-        return PLAYER_URL + str(vid_id)
-    return "URL_NOT_FOUND"
+# ─── Banner ───────────────────────────────────────────────────────────────────
+def print_banner():
+    print(f"""
+{C.CYAN}{C.BOLD}
+╔══════════════════════════════════════════════════════════════════╗
+║     Bridge to Success  —  No-Login Batch Extractor              ║
+║     ──────────────────────────────────────────────              ║
+║     Extracts ALL courses & free content without login           ║
+╚══════════════════════════════════════════════════════════════════╝
+{C.END}""")
 
 
-def extract_pdf_url(pdf_data: dict) -> str:
-    fields = [
-        "pdf_url", "pdfUrl", "pdf_link", "file_url", "url",
-        "pdf_file", "file", "link", "pdf_path"
-    ]
-    for f in fields:
-        val = pdf_data.get(f)
-        if val and isinstance(val, str) and len(val) > 3:
-            if val.startswith("storage/"):
-                return BASE_URL + "/public/" + val
-            if val.startswith("http"):
-                return val
-            if not val.startswith("/"):
-                return STORAGE_PDF + val
-    pdf_name = pdf_data.get("pdf_name") or pdf_data.get("name") or pdf_data.get("pdf_id")
-    if pdf_name:
-        return STORAGE_PDF + str(pdf_name)
-    return "URL_NOT_FOUND"
+# ─── Fetch Functions ──────────────────────────────────────────────────────────
+def fetch_all_courses() -> list:
+    """tag: allCourses | userId: "" | isEBook: 0"""
+    print(f"{C.YELLOW}[*] Fetching all courses...{C.END}")
+    data = post("allCourses", {"isEBook": "0"})
+    return safe_list(data, "data", "courses", "course")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONTENT FETCHERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_all_batches(token: str, user_id: int) -> list:
-    results = []
-
-    my_courses_resp = api_get("my_courses", user_id=user_id)
-    courses = []
-    if my_courses_resp.get("status") == 1:
-        courses = my_courses_resp.get("data", [])
-        if isinstance(courses, dict):
-            courses = list(courses.values())
-    logger.info(f"Found {len(courses)} enrolled courses")
-
-    all_courses_resp = api_get("all_courses", user_id=user_id)
-    if all_courses_resp.get("status") == 1:
-        all_c = all_courses_resp.get("data", [])
-        if isinstance(all_c, dict):
-            all_c = list(all_c.values())
-        existing_ids = {c.get("id") or c.get("course_id") for c in courses}
-        for c in all_c:
-            cid = c.get("id") or c.get("course_id")
-            if cid not in existing_ids:
-                courses.append(c)
-
-    for course in courses:
-        course_id   = course.get("id") or course.get("course_id")
-        course_name = course.get("name") or course.get("course_name") or f"Course-{course_id}"
-        logger.info(f"Processing course: {course_name} ({course_id})")
-
-        batch_resp = api_post("batch_list", {"course_id": course_id}, user_id=user_id)
-        batches = batch_resp.get("data", [])
-        if isinstance(batches, dict):
-            batches = list(batches.values())
-        if not batches:
-            detail_resp = api_post("course_detail", {"course_id": course_id}, user_id=user_id)
-            batches = detail_resp.get("data", {}).get("batch", []) or []
-
-        for batch in batches:
-            batch_id   = batch.get("id") or batch.get("batch_id")
-            batch_name = batch.get("name") or batch.get("batch_name") or f"Batch-{batch_id}"
-
-            subject_resp = api_post(
-                "subject_list",
-                {"course_id": course_id, "batch_id": batch_id},
-                user_id=user_id
-            )
-            subjects = subject_resp.get("data", [])
-            if isinstance(subjects, dict):
-                subjects = list(subjects.values())
-
-            for subject in subjects:
-                subject_id   = subject.get("id") or subject.get("subject_id")
-                subject_name = subject.get("name") or subject.get("subject_name") or f"Subject-{subject_id}"
-
-                chapter_resp = api_post(
-                    "chapter_list",
-                    {"course_id": course_id, "batch_id": batch_id, "subject_id": subject_id},
-                    user_id=user_id
-                )
-                chapters = chapter_resp.get("data", [])
-                if isinstance(chapters, dict):
-                    chapters = list(chapters.values())
-
-                for chapter in chapters:
-                    chapter_id   = chapter.get("id") or chapter.get("chapter_id")
-                    chapter_name = chapter.get("name") or chapter.get("chapter_name") or f"Chapter-{chapter_id}"
-
-                    # Videos
-                    video_resp = api_post(
-                        "video_list",
-                        {"course_id": course_id, "batch_id": batch_id,
-                         "subject_id": subject_id, "chapter_id": chapter_id},
-                        user_id=user_id
-                    )
-                    videos = video_resp.get("data", [])
-                    if isinstance(videos, dict):
-                        videos = list(videos.values())
-                    for video in videos:
-                        results.append({
-                            "type"       : "VIDEO",
-                            "course"     : course_name,
-                            "batch"      : batch_name,
-                            "subject"    : subject_name,
-                            "chapter"    : chapter_name,
-                            "title"      : video.get("title") or video.get("name") or "Untitled",
-                            "url"        : extract_video_url(video),
-                            "duration"   : video.get("duration") or video.get("video_duration") or "",
-                            "video_type" : video.get("video_type") or video.get("type") or "unknown",
-                        })
-
-                    # PDFs
-                    pdf_resp = api_post(
-                        "pdf_list",
-                        {"course_id": course_id, "batch_id": batch_id,
-                         "subject_id": subject_id, "chapter_id": chapter_id},
-                        user_id=user_id
-                    )
-                    pdfs = pdf_resp.get("data", [])
-                    if isinstance(pdfs, dict):
-                        pdfs = list(pdfs.values())
-                    for pdf in pdfs:
-                        results.append({
-                            "type"    : "PDF",
-                            "course"  : course_name,
-                            "batch"   : batch_name,
-                            "subject" : subject_name,
-                            "chapter" : chapter_name,
-                            "title"   : pdf.get("title") or pdf.get("name") or "Untitled",
-                            "url"     : extract_pdf_url(pdf),
-                        })
-
-                    time.sleep(0.3)
-
-    return results
+def fetch_top_courses() -> list:
+    """tag: topCourses | userId: "" | isEBook: 0"""
+    print(f"{C.YELLOW}[*] Fetching top/featured courses...{C.END}")
+    data = post("topCourses", {"isEBook": "0"})
+    return safe_list(data, "data", "courses", "course")
 
 
-def fetch_free_content(user_id: int = 0) -> list:
-    results = []
-
-    fv_resp = api_get("free_videos", user_id=user_id)
-    free_vids = fv_resp.get("data", [])
-    if isinstance(free_vids, dict):
-        free_vids = list(free_vids.values())
-    for v in free_vids:
-        results.append({
-            "type"   : "FREE_VIDEO",
-            "title"  : v.get("title") or v.get("name") or "Free Video",
-            "url"    : extract_video_url(v),
-            "course" : v.get("course_name") or "Free",
-        })
-
-    fp_resp = api_get("free_pdfs", user_id=user_id)
-    free_pdfs = fp_resp.get("data", [])
-    if isinstance(free_pdfs, dict):
-        free_pdfs = list(free_pdfs.values())
-    for p in free_pdfs:
-        results.append({
-            "type"   : "FREE_PDF",
-            "title"  : p.get("title") or p.get("name") or "Free PDF",
-            "url"    : extract_pdf_url(p),
-            "course" : p.get("course_name") or "Free",
-        })
-
-    return results
+def fetch_course_info(course_id: str) -> dict:
+    """tag: courseInfo | courseId, userId: ""  — description, faculty, etc."""
+    data = post("courseInfo", {"courseId": course_id})
+    if data:
+        return data.get("data") or {}
+    return {}
 
 
-def format_content_list(items: list, max_chars: int = 4000) -> list:
-    chunks = []
-    current = ""
-    for i, item in enumerate(items, 1):
-        icon = "🎬" if "VIDEO" in item["type"] else "📄"
-        line = (
-            f"{icon} *{i}. {item['title']}*\n"
-            f"   📂 {item.get('course','')}"
-        )
-        if item.get("batch"):
-            line += f" → {item['batch']}"
-        if item.get("subject"):
-            line += f"\n   📌 {item['subject']}"
-        if item.get("chapter"):
-            line += f" → {item['chapter']}"
-        line += f"\n   🔗 `{item['url']}`\n\n"
+def fetch_subjects(course_id: str) -> list:
+    """tag: getCategory | courseId, categoryId: ""  — subject list"""
+    data = post("getCategory", {"courseId": course_id, "categoryId": ""})
+    result = safe_list(data, "data", "categories", "category", "subjects")
+    if not result:
+        # fallback: getAllCategory
+        data2 = post("getAllCategory", {"courseId": course_id})
+        result = safe_list(data2, "data", "categories", "category")
+    return result
 
-        if len(current) + len(line) > max_chars:
-            chunks.append(current)
-            current = line
+
+def fetch_free_videos(user_id: str = "") -> list:
+    """tag: freeCourseVideo | userId: ""  — publicly listed free videos"""
+    data = post("freeCourseVideo", {"userId": user_id})
+    return safe_list(data, "data", "videos", "video")
+
+
+def fetch_free_pdfs(user_id: str = "") -> list:
+    """tag: freeCoursePdf | userId: ""  — publicly listed free PDFs"""
+    data = post("freeCoursePdf", {"userId": user_id})
+    return safe_list(data, "data", "pdfs", "pdf")
+
+
+def fetch_configuration() -> dict:
+    """tag: configuration  — app settings, player config"""
+    data = post("configuration")
+    return data or {}
+
+
+def fetch_banners() -> list:
+    """tag: banner | userId: "", bannerType: ""  — home banners"""
+    data = post("banner", {"bannerType": ""})
+    return safe_list(data, "data", "banners", "banner")
+
+
+# ─── Display ──────────────────────────────────────────────────────────────────
+def get_field(obj: dict, *keys):
+    """Try multiple keys, return first non-empty value."""
+    for k in keys:
+        v = obj.get(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def display_courses(courses: list, label: str = "COURSES"):
+    if not courses:
+        print(f"{C.RED}  No courses found.{C.END}")
+        return
+
+    print(f"\n{C.GREEN}{C.BOLD}{'═'*78}")
+    print(f"  {label}  ({len(courses)} found)")
+    print(f"{'═'*78}{C.END}")
+    print(f"{C.BOLD}  {'#':<4} {'TITLE':<42} {'ID':<10} {'PRICE':<10} {'FREE'}{C.END}")
+    print(f"{C.GREEN}  {'─'*74}{C.END}")
+
+    for i, c in enumerate(courses, 1):
+        title = get_field(c, "title", "courseName", "name", "course_name")[:40]
+        cid   = get_field(c, "id", "courseId", "course_id")[:8]
+        price = get_field(c, "price", "coursePrice", "amount", "fee") or "N/A"
+        free  = "YES" if str(c.get("isFree", c.get("free", "0"))) in ("1", "true", "True") else "no"
+
+        col = C.CYAN if i % 2 == 0 else C.BLUE
+        print(f"{col}  {i:<4} {title:<42} {cid:<10} {price:<10} {free}{C.END}")
+
+    print(f"{C.GREEN}{'═'*78}{C.END}\n")
+
+
+# ─── Extraction ───────────────────────────────────────────────────────────────
+def extract_single_course(course: dict, outfile, depth: int = 0) -> tuple[int, int, int]:
+    """
+    Extract subjects + free videos/PDFs for one course.
+    Returns (videos, pdfs, subjects).
+    """
+    pad = "  " * depth
+
+    course_id    = get_field(course, "id", "courseId", "course_id")
+    course_title = get_field(course, "title", "courseName", "name") or f"Course_{course_id}"
+    course_img   = get_field(course, "courseImage", "image", "thumbnail", "thumb")
+    course_price = get_field(course, "price", "coursePrice", "amount") or "N/A"
+    course_desc  = get_field(course, "description", "courseDescription", "about") or ""
+    faculty      = get_field(course, "facultyName", "faculty", "teacher", "instructor") or ""
+    is_free      = str(course.get("isFree", course.get("free", "0"))) in ("1", "true", "True")
+
+    outfile.write(f"{pad}┌{'─'*74}┐\n")
+    outfile.write(f"{pad}│  COURSE  : {course_title}\n")
+    outfile.write(f"{pad}│  ID      : {course_id}\n")
+    outfile.write(f"{pad}│  Price   : {'FREE' if is_free else course_price}\n")
+    if faculty:
+        outfile.write(f"{pad}│  Faculty : {faculty}\n")
+    if course_img:
+        img_url = COURSE_HOST + course_img if not course_img.startswith("http") else course_img
+        outfile.write(f"{pad}│  Image   : {img_url}\n")
+    if course_desc:
+        outfile.write(f"{pad}│  About   : {course_desc[:200]}\n")
+    outfile.write(f"{pad}└{'─'*74}┘\n\n")
+
+    total_videos = 0
+    total_pdfs   = 0
+
+    if not course_id:
+        outfile.write(f"{pad}  [!] No course ID — cannot fetch subjects.\n\n")
+        return 0, 0, 0
+
+    # ── Fetch Subjects ──
+    subjects = fetch_subjects(course_id)
+    outfile.write(f"{pad}  Subjects found: {len(subjects)}\n\n")
+    time.sleep(0.3)
+
+    for s_idx, subj in enumerate(subjects, 1):
+        sub_id   = get_field(subj, "id", "categoryId", "subjectId", "subject_id")
+        sub_name = get_field(subj, "categoryName", "name", "subjectName", "title") or f"Subject {s_idx}"
+        sub_count = get_field(subj, "classCount", "videoCount", "count") or ""
+
+        outfile.write(f"{pad}  {'─'*70}\n")
+        outfile.write(f"{pad}  ► SUBJECT [{s_idx}]: {sub_name}\n")
+        outfile.write(f"{pad}    ID: {sub_id}")
+        if sub_count:
+            outfile.write(f"  |  Items: {sub_count}")
+        outfile.write("\n\n")
+
+        # Free videos under this subject
+        sub_videos = []
+        sub_pdfs   = []
+
+        # Try myCourseVideo with empty userId - returns content list
+        vdata = post("myCourseVideo", {"categoryId": sub_id, "userId": ""})
+        sub_videos = safe_list(vdata, "data", "videos", "video")
+
+        pdata = post("myCoursePdf", {"categoryId": sub_id, "userId": ""})
+        sub_pdfs = safe_list(pdata, "data", "pdfs", "pdf")
+
+        if sub_videos:
+            outfile.write(f"{pad}    ── VIDEOS ({len(sub_videos)}) ──\n")
+            for v in sub_videos:
+                v_title = get_field(v, "title", "videoTitle", "name") or "Untitled"
+                v_id    = get_field(v, "id", "videoId")
+                v_link  = get_field(v, "videoLink", "link", "url", "streamUrl")
+                v_file  = get_field(v, "videoFile", "file", "fileName")
+                v_ytid  = get_field(v, "ytvideoId", "youtubeId", "yt_id")
+                v_type  = get_field(v, "videoType", "type", "playerType")
+                v_dur   = get_field(v, "duration", "videoDuration")
+                v_lock  = get_field(v, "isLock", "locked", "isPurchased")
+
+                outfile.write(f"{pad}    • {v_title}\n")
+                outfile.write(f"{pad}      ID    : {v_id}  |  Type: {v_type}  |  Duration: {v_dur or 'N/A'}\n")
+                outfile.write(f"{pad}      Locked: {v_lock or 'N/A'}\n")
+
+                if v_link:
+                    outfile.write(f"{pad}      Link  : {v_link}\n")
+                if v_file:
+                    full = VIDEO_HOST + v_file if not v_file.startswith("http") else v_file
+                    outfile.write(f"{pad}      File  : {full}\n")
+                if v_ytid:
+                    outfile.write(f"{pad}      YT    : https://www.youtube.com/watch?v={v_ytid}\n")
+                outfile.write("\n")
+                total_videos += 1
         else:
-            current += line
+            outfile.write(f"{pad}    (No videos or access required)\n")
 
-    if current:
-        chunks.append(current)
-    return chunks if chunks else ["No content found."]
+        if sub_pdfs:
+            outfile.write(f"\n{pad}    ── PDFs ({len(sub_pdfs)}) ──\n")
+            for p in sub_pdfs:
+                p_title = get_field(p, "title", "pdfTitle", "name") or "Untitled"
+                p_id    = get_field(p, "id", "pdfId")
+                p_file  = get_field(p, "pdfFile", "file", "url", "fileName")
+                p_lock  = get_field(p, "isLock", "locked", "isPurchased")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BOT HANDLERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🔑 Login (OTP)", callback_data="menu_login")],
-        [InlineKeyboardButton("🆓 Free Content (No Login)", callback_data="menu_free")],
-        [InlineKeyboardButton("📦 Extract All Batches", callback_data="menu_batches")],
-        [InlineKeyboardButton("🎬 All Videos Only", callback_data="menu_videos")],
-        [InlineKeyboardButton("📄 All PDFs Only", callback_data="menu_pdfs")],
-        [InlineKeyboardButton("ℹ️ App Info & Loopholes", callback_data="menu_info")],
-        [InlineKeyboardButton("🚪 Logout", callback_data="menu_logout")],
-    ]
-    await update.message.reply_text(
-        "🎓 *Bridge to Success — Content Extractor*\n\n"
-        "This bot can extract all batch videos and PDFs from the app.\n\n"
-        "Choose an option below:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Commands*\n\n"
-        "/start — Main menu\n"
-        "/login — Login with mobile OTP\n"
-        "/free — Get free content (no login needed)\n"
-        "/batches — Extract all batch content\n"
-        "/videos — Get all video links\n"
-        "/pdfs — Get all PDF links\n"
-        "/info — App analysis & security loopholes\n"
-        "/logout — Clear your session\n",
-        parse_mode="Markdown"
-    )
-
-
-async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["login_step"] = "awaiting_mobile"
-    msg = (
-        update.callback_query.message
-        if hasattr(update, "callback_query") and update.callback_query
-        else update.message
-    )
-    await msg.reply_text(
-        "📱 Enter your registered *mobile number* (10 digits, no country code):",
-        parse_mode="Markdown"
-    )
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text.strip()
-    step = context.user_data.get("login_step", "")
-
-    if step == "awaiting_mobile":
-        # Accept: 10 digits, or with country code like 91XXXXXXXXXX or +91XXXXXXXXXX
-        clean = text.replace("+", "").replace(" ", "").replace("-", "")
-        if not clean.isdigit():
-            await update.message.reply_text("❌ Enter digits only (e.g. 9876543210 or 919876543210).")
-            return
-        if len(clean) == 10:
-            mobile_plain  = clean          # 10-digit
-            mobile_cc     = "91" + clean   # with country code
-        elif len(clean) == 12 and clean.startswith("91"):
-            mobile_plain  = clean[2:]      # strip 91
-            mobile_cc     = clean
-        elif len(clean) == 11 and clean.startswith("0"):
-            mobile_plain  = clean[1:]
-            mobile_cc     = "91" + clean[1:]
+                outfile.write(f"{pad}    • {p_title}\n")
+                outfile.write(f"{pad}      ID    : {p_id}  |  Locked: {p_lock or 'N/A'}\n")
+                if p_file:
+                    full = PDF_HOST + p_file if not p_file.startswith("http") else p_file
+                    outfile.write(f"{pad}      PDF   : {full}\n")
+                outfile.write("\n")
+                total_pdfs += 1
         else:
-            mobile_plain  = clean
-            mobile_cc     = clean
+            outfile.write(f"{pad}    (No PDFs or access required)\n")
 
-        context.user_data["mobile"]     = mobile_plain
-        context.user_data["mobile_cc"]  = mobile_cc
-        context.user_data["login_step"] = "awaiting_otp"
+        outfile.write("\n")
+        time.sleep(0.35)
 
-        # Try every combination — log real server response for debugging
-        best_msg = ""
-        for mobile_val in [mobile_plain, mobile_cc]:
-            for payload in [
-                {"mobile": mobile_val, "type": "login"},
-                {"mobile": mobile_val, "type": "register"},
-                {"mobile": mobile_val},
-            ]:
-                r = api_post("send_otp", payload)
-                logger.info(f"send_otp payload={payload} | response={r}")
-                if r.get("status") == 1:
-                    best_msg = r.get("message", "OTP sent!")
-                    break
-            if best_msg:
-                break
+    return total_videos, total_pdfs, len(subjects)
 
-        if best_msg:
-            await update.message.reply_text(
-                f"✅ *{best_msg}*
 
-Enter the OTP you received on *{mobile_plain}*:",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                f"⚠️ *Server did not confirm OTP.* Check Koyeb logs for exact server response.
+def extract_free_section(outfile):
+    """Extract globally listed free videos and PDFs."""
+    print(f"\n{C.CYAN}[*] Fetching free videos & PDFs...{C.END}")
 
-"
-                f"Tried numbers: `{mobile_plain}` and `{mobile_cc}`
+    free_videos = fetch_free_videos()
+    free_pdfs   = fetch_free_pdfs()
 
-"
-                f"If you got an OTP on your phone, enter it now.
-"
-                f"Otherwise this number may not be registered in the app.",
-                parse_mode="Markdown"
-            )
+    outfile.write(f"\n{'═'*80}\n")
+    outfile.write(f"  FREE VIDEOS & PDFs (No Login Required)\n")
+    outfile.write(f"{'═'*80}\n\n")
 
-    elif step == "awaiting_otp":
-        mobile    = context.user_data.get("mobile", "")
-        mobile_cc = context.user_data.get("mobile_cc", mobile)
-        if not text.isdigit():
-            await update.message.reply_text("❌ OTP must be digits only.")
-            return
-
-        resp = {"status": 0}
-        for mob in [mobile, mobile_cc]:
-            for ep in ["login", "verify_otp"]:
-                r = api_post(ep, {"mobile": mob, "otp": text})
-                logger.info(f"{ep} mobile={mob} otp={text} response={r}")
-                if r.get("status") == 1:
-                    resp = r
-                    break
-            if resp.get("status") == 1:
-                break
-
-        if resp.get("status") == 1:
-            data    = resp.get("data", {})
-            token   = (
-                data.get("token") or data.get("authtoken") or
-                data.get("api_token") or data.get("access_token") or ""
-            )
-            user_id = data.get("id") or data.get("user_id") or data.get("userId") or ""
-            name    = data.get("name") or data.get("full_name") or mobile
-
-            user_sessions[uid] = {
-                "token"   : token,
-                "user_id" : str(user_id),
-                "mobile"  : mobile,
-                "name"    : name,
-            }
-            context.user_data["login_step"] = ""
-            await update.message.reply_text(
-                f"✅ *Logged in as {name}!*\n\nNow use /batches to extract all content.",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ Login failed: {resp.get('message','Wrong OTP or account not found.')}"
-            )
-            context.user_data["login_step"] = ""
-
+    if free_videos:
+        outfile.write(f"── FREE VIDEOS ({len(free_videos)}) ──\n\n")
+        for v in free_videos:
+            v_title = get_field(v, "title", "videoTitle", "name") or "Untitled"
+            v_link  = get_field(v, "videoLink", "link", "url")
+            v_file  = get_field(v, "videoFile", "file")
+            v_ytid  = get_field(v, "ytvideoId", "youtubeId")
+            v_type  = get_field(v, "videoType", "type") or "N/A"
+            outfile.write(f"  • {v_title}  [type: {v_type}]\n")
+            if v_link:  outfile.write(f"    Link : {v_link}\n")
+            if v_file:  outfile.write(f"    File : {VIDEO_HOST + v_file}\n")
+            if v_ytid:  outfile.write(f"    YT   : https://www.youtube.com/watch?v={v_ytid}\n")
+            outfile.write("\n")
     else:
-        await update.message.reply_text(
-            "Use /start to see the menu or /login to authenticate."
-        )
+        outfile.write("  (No free videos found)\n\n")
+
+    if free_pdfs:
+        outfile.write(f"── FREE PDFs ({len(free_pdfs)}) ──\n\n")
+        for p in free_pdfs:
+            p_title = get_field(p, "title", "pdfTitle", "name") or "Untitled"
+            p_file  = get_field(p, "pdfFile", "file", "url")
+            outfile.write(f"  • {p_title}\n")
+            if p_file:  outfile.write(f"    PDF  : {PDF_HOST + p_file}\n")
+            outfile.write("\n")
+    else:
+        outfile.write("  (No free PDFs found)\n\n")
+
+    print(f"{C.GREEN}  Free videos: {len(free_videos)}  |  Free PDFs: {len(free_pdfs)}{C.END}")
+    return len(free_videos), len(free_pdfs)
 
 
-async def get_free_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        update.callback_query.message
-        if hasattr(update, "callback_query") and update.callback_query
-        else update.message
-    )
-    await msg.reply_text("🔍 Fetching free content (no login required)...")
-
-    uid   = update.effective_user.id
-    items = fetch_free_content(user_id=uid)
-
-    if not items:
-        await msg.reply_text(
-            "ℹ️ No free content returned. The server may require login even for free items.\n"
-            "Try /login first."
-        )
-        return
-
-    await msg.reply_text(f"✅ Found *{len(items)}* free items:", parse_mode="Markdown")
-    for chunk in format_content_list(items):
-        await msg.reply_text(chunk, parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def get_all_batches(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    msg = (
-        update.callback_query.message
-        if hasattr(update, "callback_query") and update.callback_query
-        else update.message
-    )
-
-    if uid not in user_sessions:
-        await msg.reply_text("⚠️ You must /login first.")
-        return
-
-    session = user_sessions[uid]
-    await msg.reply_text(
-        f"⚙️ Extracting all batch content for *{session['name']}*...\n"
-        "_This may take a few minutes depending on how many courses you have._",
-        parse_mode="Markdown"
-    )
-
-    try:
-        items = fetch_all_batches(session["token"], uid)
-    except Exception as e:
-        await msg.reply_text(f"❌ Error during extraction: {e}")
-        return
-
-    if not items:
-        await msg.reply_text(
-            "⚠️ No content found. Possible reasons:\n"
-            "• No enrolled courses\n"
-            "• API response structure differs\n"
-            "• Token expired — try /login again"
-        )
-        return
-
-    videos = [i for i in items if "VIDEO" in i["type"]]
-    pdfs   = [i for i in items if "PDF"   in i["type"]]
-
-    await msg.reply_text(
-        f"✅ *Extraction Complete!*\n\n"
-        f"🎬 Videos : {len(videos)}\n"
-        f"📄 PDFs   : {len(pdfs)}\n"
-        f"📦 Total  : {len(items)}\n\nSending links now...",
-        parse_mode="Markdown"
-    )
-
-    if videos:
-        await msg.reply_text("*🎬 VIDEO LINKS:*", parse_mode="Markdown")
-        for chunk in format_content_list(videos):
-            await msg.reply_text(chunk, parse_mode="Markdown", disable_web_page_preview=True)
-
-    if pdfs:
-        await msg.reply_text("*📄 PDF LINKS:*", parse_mode="Markdown")
-        for chunk in format_content_list(pdfs):
-            await msg.reply_text(chunk, parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def get_videos_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    msg = (
-        update.callback_query.message
-        if hasattr(update, "callback_query") and update.callback_query
-        else update.message
-    )
-    if uid not in user_sessions:
-        await msg.reply_text("⚠️ Please /login first.")
-        return
-    session = user_sessions[uid]
-    await msg.reply_text("⚙️ Extracting video links...")
-    items  = fetch_all_batches(session["token"], uid)
-    videos = [i for i in items if "VIDEO" in i["type"]]
-    await msg.reply_text(f"✅ Found *{len(videos)}* videos:", parse_mode="Markdown")
-    for chunk in format_content_list(videos):
-        await msg.reply_text(chunk, parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def get_pdfs_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    msg = (
-        update.callback_query.message
-        if hasattr(update, "callback_query") and update.callback_query
-        else update.message
-    )
-    if uid not in user_sessions:
-        await msg.reply_text("⚠️ Please /login first.")
-        return
-    session = user_sessions[uid]
-    await msg.reply_text("⚙️ Extracting PDF links...")
-    items = fetch_all_batches(session["token"], uid)
-    pdfs  = [i for i in items if "PDF" in i["type"]]
-    await msg.reply_text(f"✅ Found *{len(pdfs)}* PDFs:", parse_mode="Markdown")
-    for chunk in format_content_list(pdfs):
-        await msg.reply_text(chunk, parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        update.callback_query.message
-        if hasattr(update, "callback_query") and update.callback_query
-        else update.message
-    )
-    info = (
-        "🔍 *Bridge to Success — App Analysis*\n\n"
-        "📦 *Package*: `com.lct.bmightc`\n"
-        "🏗 *Platform*: learncentre.tech (StudyTrend SaaS)\n"
-        "🌐 *API Base*: `study_api_sprint13_security_promo`\n\n"
-        "⚠️ *Security Loopholes Found:*\n\n"
-        "1️⃣ *IDOR on Storage URLs* — PDFs & videos at predictable paths:\n"
-        "   `…/public/storage/pdf/<filename>` — no auth check\n\n"
-        "2️⃣ *Unauthenticated Free Content* — `/get-free-video` & `/get-free-pdf` "
-        "accessible without token\n\n"
-        "3️⃣ *API Hardcoded in Plaintext* — full API path visible in APK DEX\n\n"
-        "4️⃣ *No Certificate Pinning* — MITM proxy intercepts all traffic\n\n"
-        "5️⃣ *Token in SharedPreferences* — readable on rooted device\n\n"
-        "6️⃣ *Video Proxy Exposed* — `ytdl.movx.in` & `ytapi.skynetwing.com` "
-        "return direct MP4/HLS without auth\n\n"
-        "7️⃣ *Test URL User Impersonation* — `?test_id=X&user_id=Y` injectable\n\n"
-        "8️⃣ *Security-by-obscurity* — 'sprint13_security_promo' is not real security\n\n"
-        "📡 *All Media Storage Bases:*\n"
-        f"`{STORAGE_VID}`\n`{STORAGE_PDF}`\n"
-        f"`{PLAYER_URL}<ID>`\n`{LIVE_URL}<ID>`"
-    )
-    await msg.reply_text(info, parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid in user_sessions:
-        del user_sessions[uid]
-    msg = (
-        update.callback_query.message
-        if hasattr(update, "callback_query") and update.callback_query
-        else update.message
-    )
-    await msg.reply_text("🚪 Logged out. Session cleared.")
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data
-
-    if   action == "menu_login"  : await login_start(update, context)
-    elif action == "menu_free"   : await get_free_content(update, context)
-    elif action == "menu_batches": await get_all_batches(update, context)
-    elif action == "menu_videos" : await get_videos_only(update, context)
-    elif action == "menu_pdfs"   : await get_pdfs_only(update, context)
-    elif action == "menu_info"   : await show_info(update, context)
-    elif action == "menu_logout" : await logout(update, context)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HEALTH CHECK SERVER  (required for Koyeb Web Service — binds to $PORT)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK - Bot is running")
-
-    def log_message(self, format, *args):
-        pass  # suppress access logs
-
-
-def run_health_server():
-    port = int(os.environ.get("PORT", 8000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"Health server listening on port {port}")
-    server.serve_forever()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN environment variable is not set!")
+    print_banner()
+
+    # ── Step 1: Fetch all courses ──
+    all_courses = fetch_all_courses()
+    top_courses = fetch_top_courses()
+
+    if not all_courses and not top_courses:
+        print(f"{C.RED}[!] Could not fetch any courses.")
+        print(f"    Possible reasons:")
+        print(f"    1. API endpoint changed (check if sprint13 is still active)")
+        print(f"    2. Server requires login even for allCourses")
+        print(f"    3. Network issue{C.END}")
         sys.exit(1)
 
-    # Start health-check HTTP server in a background daemon thread
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
+    # Merge and deduplicate
+    seen = set()
+    combined = []
+    for c in (all_courses + top_courses):
+        cid = c.get("id") or c.get("courseId") or id(c)
+        if cid not in seen:
+            seen.add(cid)
+            combined.append(c)
 
-    # Build and start the Telegram bot
-    app = Application.builder().token(BOT_TOKEN).build()
+    print(f"{C.GREEN}[+] Found {len(combined)} course(s) total{C.END}")
 
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("help",    help_cmd))
-    app.add_handler(CommandHandler("login",   login_start))
-    app.add_handler(CommandHandler("free",    get_free_content))
-    app.add_handler(CommandHandler("batches", get_all_batches))
-    app.add_handler(CommandHandler("videos",  get_videos_only))
-    app.add_handler(CommandHandler("pdfs",    get_pdfs_only))
-    app.add_handler(CommandHandler("info",    show_info))
-    app.add_handler(CommandHandler("logout",  logout))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # ── Step 2: Display ──
+    display_courses(combined, "ALL AVAILABLE BATCHES / COURSES")
 
-    logger.info("Bot is running...")
-    app.run_polling(drop_pending_updates=True)
+    # ── Step 3: User choice ──
+    print(f"{C.BOLD}What would you like to do?{C.END}")
+    print(f"  1. Extract ALL courses at once (full dump)")
+    print(f"  2. Extract a specific course")
+    print(f"  3. Extract only free videos & PDFs")
+    print(f"  4. Show all course info (no deep extraction)")
+
+    choice = input(f"\n{C.YELLOW}Select (1/2/3/4): {C.END}").strip()
+
+    output_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # ── Option 3: Free content only ──
+    if choice == "3":
+        fname = "BridgeToSuccess_Free_Content.txt"
+        fpath = os.path.join(output_dir, fname)
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write("BRIDGE TO SUCCESS — FREE CONTENT\n")
+            f.write(f"Extracted: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            extract_free_section(f)
+        print(f"\n{C.GREEN}[+] Saved to: {fpath}{C.END}")
+        return
+
+    # ── Option 4: Info only ──
+    if choice == "4":
+        fname = "BridgeToSuccess_CourseList.txt"
+        fpath = os.path.join(output_dir, fname)
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write("BRIDGE TO SUCCESS — COURSE LIST\n")
+            f.write(f"Extracted: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"Total Courses: {len(combined)}\n\n")
+            f.write(f"{'─'*80}\n\n")
+            for i, c in enumerate(combined, 1):
+                title    = get_field(c, "title", "courseName", "name") or "N/A"
+                cid      = get_field(c, "id", "courseId") or "N/A"
+                price    = get_field(c, "price", "coursePrice", "amount") or "N/A"
+                faculty  = get_field(c, "facultyName", "faculty", "teacher") or "N/A"
+                img      = get_field(c, "courseImage", "image", "thumbnail") or ""
+                is_free  = str(c.get("isFree", c.get("free", "0"))) in ("1","true","True")
+                desc     = get_field(c, "description", "courseDescription", "about") or ""
+                f.write(f"[{i}] {title}\n")
+                f.write(f"    ID      : {cid}\n")
+                f.write(f"    Price   : {'FREE' if is_free else price}\n")
+                f.write(f"    Faculty : {faculty}\n")
+                if img:
+                    f.write(f"    Image   : {COURSE_HOST + img if not img.startswith('http') else img}\n")
+                if desc:
+                    f.write(f"    About   : {desc[:300]}\n")
+                f.write("\n")
+        print(f"\n{C.GREEN}[+] Saved to: {fpath}{C.END}")
+        return
+
+    # ── Options 1 & 2: Deep extraction ──
+    if choice == "1":
+        targets = combined
+        fname = "BridgeToSuccess_ALL_Courses.txt"
+    elif choice == "2":
+        while True:
+            try:
+                idx = int(input(f"{C.YELLOW}Enter course number (1-{len(combined)}): {C.END}")) - 1
+                if 0 <= idx < len(combined):
+                    targets = [combined[idx]]
+                    title_slug = sanitize(get_field(combined[idx], "title", "courseName", "name") or "course")
+                    fname = f"BridgeToSuccess_{title_slug}.txt"
+                    break
+                print(f"{C.RED}  Out of range.{C.END}")
+            except ValueError:
+                print(f"{C.RED}  Please enter a number.{C.END}")
+    else:
+        print(f"{C.RED}Invalid choice.{C.END}")
+        return
+
+    fpath = os.path.join(output_dir, fname)
+
+    total_v = total_p = total_s = 0
+
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write(f"{'='*80}\n")
+        f.write(f"  BRIDGE TO SUCCESS — BATCH EXTRACTION\n")
+        f.write(f"  Extracted : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"  Courses   : {len(targets)}\n")
+        f.write(f"{'='*80}\n\n")
+
+        # Free content section
+        fv, fp = extract_free_section(f)
+
+        f.write(f"\n{'='*80}\n")
+        f.write(f"  COURSE DETAILS\n")
+        f.write(f"{'='*80}\n\n")
+
+        for i, course in enumerate(targets, 1):
+            title = get_field(course, "title", "courseName", "name") or f"Course {i}"
+            print(f"\n{C.CYAN}{C.BOLD}  [{i}/{len(targets)}] Extracting: {title}{C.END}")
+
+            v, p, s = extract_single_course(course, f)
+            total_v += v
+            total_p += p
+            total_s += s
+
+            print(f"{C.GREEN}      Subjects: {s}  |  Videos: {v}  |  PDFs: {p}{C.END}")
+
+        # Summary
+        f.write(f"\n{'='*80}\n")
+        f.write(f"  SUMMARY\n")
+        f.write(f"{'='*80}\n")
+        f.write(f"  Courses extracted : {len(targets)}\n")
+        f.write(f"  Total Subjects    : {total_s}\n")
+        f.write(f"  Total Videos      : {total_v}\n")
+        f.write(f"  Total PDFs        : {total_p}\n")
+        f.write(f"  Free Videos       : {fv}\n")
+        f.write(f"  Free PDFs         : {fp}\n")
+        f.write(f"  Grand Total Links : {total_v + total_p + fv + fp}\n")
+        f.write(f"{'='*80}\n")
+
+    print(f"\n{C.GREEN}{C.BOLD}")
+    print(f"  ╔══════════════════════════════════════════╗")
+    print(f"  ║   EXTRACTION COMPLETE                    ║")
+    print(f"  ╠══════════════════════════════════════════╣")
+    print(f"  ║  File     : {fname:<30}║")
+    print(f"  ║  Courses  : {len(targets):<30}║")
+    print(f"  ║  Subjects : {total_s:<30}║")
+    print(f"  ║  Videos   : {total_v:<30}║")
+    print(f"  ║  PDFs     : {total_p:<30}║")
+    print(f"  ╚══════════════════════════════════════════╝")
+    print(f"{C.END}")
+    print(f"  Saved to: {fpath}\n")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n\n{C.CYAN}Interrupted. Goodbye!{C.END}")
+        sys.exit(0)
