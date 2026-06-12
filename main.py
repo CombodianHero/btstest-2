@@ -447,48 +447,82 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     step = context.user_data.get("login_step", "")
 
     if step == "awaiting_mobile":
-        if not text.isdigit() or len(text) != 10:
-            await update.message.reply_text("❌ Invalid number. Enter 10-digit mobile (no spaces).")
+        # Accept: 10 digits, or with country code like 91XXXXXXXXXX or +91XXXXXXXXXX
+        clean = text.replace("+", "").replace(" ", "").replace("-", "")
+        if not clean.isdigit():
+            await update.message.reply_text("❌ Enter digits only (e.g. 9876543210 or 919876543210).")
             return
-        context.user_data["mobile"]     = text
+        if len(clean) == 10:
+            mobile_plain  = clean          # 10-digit
+            mobile_cc     = "91" + clean   # with country code
+        elif len(clean) == 12 and clean.startswith("91"):
+            mobile_plain  = clean[2:]      # strip 91
+            mobile_cc     = clean
+        elif len(clean) == 11 and clean.startswith("0"):
+            mobile_plain  = clean[1:]
+            mobile_cc     = "91" + clean[1:]
+        else:
+            mobile_plain  = clean
+            mobile_cc     = clean
+
+        context.user_data["mobile"]     = mobile_plain
+        context.user_data["mobile_cc"]  = mobile_cc
         context.user_data["login_step"] = "awaiting_otp"
 
-        # Try 3 variants: type=login, type=register, no type
-        sent = False
-        for payload in [
-            {"mobile": text, "type": "login"},
-            {"mobile": text, "type": "register"},
-            {"mobile": text},
-        ]:
-            r = api_post("send_otp", payload)
-            logger.info(f"send_otp payload={payload} response={r}")
-            if r.get("status") == 1:
-                sent = True
-                await update.message.reply_text(
-                    f"✅ OTP sent to {text}.\nNow enter the *OTP* you received:",
-                    parse_mode="Markdown"
-                )
+        # Try every combination — log real server response for debugging
+        best_msg = ""
+        for mobile_val in [mobile_plain, mobile_cc]:
+            for payload in [
+                {"mobile": mobile_val, "type": "login"},
+                {"mobile": mobile_val, "type": "register"},
+                {"mobile": mobile_val},
+            ]:
+                r = api_post("send_otp", payload)
+                logger.info(f"send_otp payload={payload} | response={r}")
+                if r.get("status") == 1:
+                    best_msg = r.get("message", "OTP sent!")
+                    break
+            if best_msg:
                 break
 
-        if not sent:
-            # Server may send OTP silently (status!=1 but OTP still arrives)
+        if best_msg:
             await update.message.reply_text(
-                f"⚠️ Server did not confirm OTP dispatch for {text}.\n"
-                f"If you received an OTP on your phone, enter it now.\n"
+                f"✅ *{best_msg}*
+
+Enter the OTP you received on *{mobile_plain}*:",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ *Server did not confirm OTP.* Check Koyeb logs for exact server response.
+
+"
+                f"Tried numbers: `{mobile_plain}` and `{mobile_cc}`
+
+"
+                f"If you got an OTP on your phone, enter it now.
+"
                 f"Otherwise this number may not be registered in the app.",
                 parse_mode="Markdown"
             )
-            # Keep login_step = awaiting_otp so user can still try
 
     elif step == "awaiting_otp":
-        mobile = context.user_data.get("mobile", "")
+        mobile    = context.user_data.get("mobile", "")
+        mobile_cc = context.user_data.get("mobile_cc", mobile)
         if not text.isdigit():
             await update.message.reply_text("❌ OTP must be digits only.")
             return
 
-        resp = api_post("login", {"mobile": mobile, "otp": text})
-        if resp.get("status") != 1:
-            resp = api_post("verify_otp", {"mobile": mobile, "otp": text})
+        resp = {"status": 0}
+        for mob in [mobile, mobile_cc]:
+            for ep in ["login", "verify_otp"]:
+                r = api_post(ep, {"mobile": mob, "otp": text})
+                logger.info(f"{ep} mobile={mob} otp={text} response={r}")
+                if r.get("status") == 1:
+                    resp = r
+                    break
+            if resp.get("status") == 1:
+                break
 
         if resp.get("status") == 1:
             data    = resp.get("data", {})
